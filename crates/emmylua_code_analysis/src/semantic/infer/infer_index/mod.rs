@@ -1,17 +1,18 @@
 mod infer_array;
 
-use std::collections::HashSet;
-
 use emmylua_parser::{
-    LuaExpr, LuaIndexExpr, LuaIndexKey, LuaIndexMemberExpr, NumberResult, PathTrait,
+    LuaAstNode, LuaChunk, LuaExpr, LuaIndexExpr, LuaIndexKey, LuaIndexMemberExpr, NumberResult,
+    PathTrait,
 };
+use hashbrown::HashSet;
 use internment::ArcIntern;
 use rowan::TextRange;
 use smol_str::SmolStr;
 
 use crate::{
-    CacheEntry, GenericTpl, InFiled, InferGuardRef, LuaAliasCallKind, LuaDeclOrMemberId,
-    LuaInferCache, LuaInstanceType, LuaMemberOwner, LuaOperatorOwner, TypeOps,
+    CacheEntry, FlowAntecedent, FlowId, FlowNode, FlowNodeKind, FlowTree, GenericTpl, InFiled,
+    InferGuardRef, LuaAliasCallKind, LuaDeclOrMemberId, LuaInferCache, LuaInstanceType,
+    LuaMemberOwner, LuaOperatorOwner, TypeOps,
     db_index::{
         DbIndex, LuaGenericType, LuaIntersectionType, LuaMemberKey, LuaObjectType,
         LuaOperatorMetaMethod, LuaTupleType, LuaType, LuaTypeDeclId, LuaUnionType,
@@ -24,7 +25,11 @@ use crate::{
             VarRefId,
             infer_index::infer_array::{check_iter_var_range, infer_array_member},
             infer_name::get_name_expr_var_ref_id,
-            narrow::infer_expr_narrow_type,
+            narrow::{
+                ConditionFlowAction, InferConditionFlow, get_condition_flow_action,
+                get_flow_assignment_info, get_flow_cache_var_ref_id, get_flow_condition_info,
+                get_var_expr_var_ref_id, infer_expr_narrow_type,
+            },
         },
         member::get_buildin_type_map_type_id,
         member::intersect_member_types,
@@ -107,11 +112,131 @@ fn infer_member_type_pass_flow(
     cache
         .index_ref_origin_type_cache
         .insert(var_ref_id.clone(), CacheEntry::Cache(member_type.clone()));
+    let file_id = cache.get_file_id();
+    if let Some(flow_tree) = db.get_flow_index().get_flow_tree(&file_id)
+        && let Some(flow_id) = flow_tree.get_flow_id(index_expr.get_syntax_id())
+        && let Some(root) = LuaChunk::cast(index_expr.get_root())
+        && matches!(
+            has_direct_index_flow_effect(db, cache, flow_tree, &root, &var_ref_id, flow_id),
+            Ok(false)
+        )
+    {
+        return Ok(member_type);
+    }
+
     let result = infer_expr_narrow_type(db, cache, LuaExpr::IndexExpr(index_expr), var_ref_id);
     match &result {
         Err(InferFailReason::None) => Ok(member_type.clone()),
         _ => result,
     }
+}
+
+fn has_direct_index_flow_effect(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    tree: &FlowTree,
+    root: &LuaChunk,
+    var_ref_id: &VarRefId,
+    start_flow_id: FlowId,
+) -> Result<bool, InferFailReason> {
+    let mut pending = vec![start_flow_id];
+    let mut visited_labels = HashSet::new();
+    let var_ref_cache_id = get_flow_cache_var_ref_id(cache, var_ref_id);
+
+    while let Some(flow_id) = pending.pop() {
+        let flow_node = tree.get_flow_node(flow_id).ok_or(InferFailReason::None)?;
+        match &flow_node.kind {
+            FlowNodeKind::Start | FlowNodeKind::Unreachable => {}
+            FlowNodeKind::BranchLabel | FlowNodeKind::NamedLabel(_) => {
+                if visited_labels.insert(flow_id) {
+                    extend_flow_antecedents(tree, flow_node, &mut pending)?;
+                }
+            }
+            FlowNodeKind::Assignment(assign_ptr) => {
+                let assignment_info =
+                    get_flow_assignment_info(db, cache, root, flow_node.id, assign_ptr)?;
+                if assignment_info
+                    .var_ref_ids
+                    .iter()
+                    .flatten()
+                    .any(|assignment_var_ref_id| assignment_var_ref_id == var_ref_id)
+                {
+                    return Ok(true);
+                }
+                extend_flow_antecedents(tree, flow_node, &mut pending)?;
+            }
+            FlowNodeKind::TrueCondition(condition_ptr)
+            | FlowNodeKind::FalseCondition(condition_ptr) => {
+                let condition_info =
+                    get_flow_condition_info(db, cache, root, flow_node.id, condition_ptr)?;
+                let condition_flow = if matches!(&flow_node.kind, FlowNodeKind::TrueCondition(_)) {
+                    InferConditionFlow::TrueCondition
+                } else {
+                    InferConditionFlow::FalseCondition
+                };
+                let condition_action = get_condition_flow_action(
+                    db,
+                    tree,
+                    cache,
+                    root,
+                    var_ref_id,
+                    var_ref_cache_id,
+                    flow_node,
+                    &condition_info,
+                    condition_flow,
+                )?;
+                if !matches!(condition_action, ConditionFlowAction::Continue) {
+                    return Ok(true);
+                }
+                extend_flow_antecedents(tree, flow_node, &mut pending)?;
+            }
+            FlowNodeKind::ImplFunc(func_ptr) => {
+                let func_stat = func_ptr.to_node(root).ok_or(InferFailReason::None)?;
+                if let Some(func_name) = func_stat.get_func_name()
+                    && get_var_expr_var_ref_id(db, cache, func_name.to_expr()).as_ref()
+                        == Some(var_ref_id)
+                {
+                    return Ok(true);
+                }
+                extend_flow_antecedents(tree, flow_node, &mut pending)?;
+            }
+            FlowNodeKind::TagCast(tag_cast_ptr) => {
+                let tag_cast = tag_cast_ptr.to_node(root).ok_or(InferFailReason::None)?;
+                if let Some(key_expr) = tag_cast.get_key_expr()
+                    && get_var_expr_var_ref_id(db, cache, key_expr).as_ref() == Some(var_ref_id)
+                {
+                    return Ok(true);
+                }
+                extend_flow_antecedents(tree, flow_node, &mut pending)?;
+            }
+            FlowNodeKind::LoopLabel
+            | FlowNodeKind::DeclPosition(_)
+            | FlowNodeKind::ForIStat(_)
+            | FlowNodeKind::Break
+            | FlowNodeKind::Return => {
+                extend_flow_antecedents(tree, flow_node, &mut pending)?;
+            }
+        }
+    }
+
+    Ok(false)
+}
+
+fn extend_flow_antecedents(
+    tree: &FlowTree,
+    flow_node: &FlowNode,
+    pending: &mut Vec<FlowId>,
+) -> Result<(), InferFailReason> {
+    match flow_node.antecedent.as_ref() {
+        Some(FlowAntecedent::Single(flow_id)) => pending.push(*flow_id),
+        Some(FlowAntecedent::Multiple(multi_id)) => pending.extend(
+            tree.get_multi_antecedents(*multi_id)
+                .ok_or(InferFailReason::None)?,
+        ),
+        None => {}
+    }
+
+    Ok(())
 }
 
 pub fn get_index_expr_var_ref_id(
